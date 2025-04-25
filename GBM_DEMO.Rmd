@@ -1,0 +1,278 @@
+---
+title: "GBM Shiny Dashboard"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+runtime: shiny
+---
+Welcome to the GBM Shiny Dashboard!  
+This interactive dashboard allows users to explore gene expression differences in glioblastoma multiforme under hypoxia vs. normoxia. Use the plots below to filter and analyze key genes across experimental conditions.
+
+```{r internal, echo=FALSE, results='hide'}
+# Loading Libraries
+library(shiny)
+library(plotly)
+library(DT)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(limma)
+library(edgeR)
+library(openxlsx)
+library(readxl)
+```
+
+```{r}
+# =================== DATA LOAD & PREP ===================
+
+# File path to normalized gene expression CSV
+GBM_data <- "GBM_normalized.csv"
+
+GBM_norm <- read.csv(GBM_data, row.names = 1)
+
+# Use 10% of the data randomly to reduce memory usage (here using 20% for testing; adjust to 0.1 for 10%)
+#set.seed(123)
+#subset_idx <- sample(nrow(GBM_norm), size = floor(0.2 * nrow(GBM_norm)))
+#GBM_norm <- GBM_norm[subset_idx, ]
+
+# Replace zeros with 1 to avoid log issues
+GBM_norm[GBM_norm == 0] <- 1
+
+# Compute log2 transform for plotting purposes only.
+numeric_columns <- sapply(GBM_norm, is.numeric)
+GBM_log2 <- GBM_norm
+GBM_log2[, numeric_columns] <- log2(GBM_norm[, numeric_columns])
+
+# (Optional) Create a long-format version for background plotting
+GBM_log_long <- GBM_log2 %>%
+  tibble::rownames_to_column(var = "Gene") %>%
+  pivot_longer(-Gene, names_to = "Sample", values_to = "Expression")
+
+# Compute mean values across replicates.
+# Assumes column names like "XD456.B.H.1", "XD456.B.H.2", etc.
+base_names <- unique(sub("\\.\\d+$", "", names(GBM_log2)))
+mean_values_df <- data.frame(matrix(ncol = length(base_names), nrow = nrow(GBM_log2)))
+colnames(mean_values_df) <- base_names
+rownames(mean_values_df) <- rownames(GBM_log2)
+for (base_name in base_names) {
+  pattern <- paste0("^", base_name, "\\.\\d+$")
+  column_indices <- grep(pattern, names(GBM_log2))
+  if (length(column_indices) > 0) {
+    replicate_cols <- GBM_log2[, column_indices, drop = FALSE]
+    mean_values_df[[base_name]] <- rowMeans(replicate_cols, na.rm = TRUE)
+  }
+}
+mean_values_df[is.na(mean_values_df)] <- 0
+cat("Data Preparation Completed. Dimensions:", dim(mean_values_df), "\n")
+
+# Source the equivalence testing function.
+source("equivtest2comp.r")
+
+# =================== UI ===================
+ui <- fluidPage(
+  titlePanel("GBM Interactive Analysis by Oceanus"),
+  sidebarLayout(
+    sidebarPanel(
+      width = 2,
+      selectInput("xeno", "Xenoline:", choices = c("XD456", "X1441", "JX39P")),
+      selectInput("model1", "Model 1:", choices = c("Bioprint", "Neurosphere", "Geltrex", "Microtumor")),
+      selectInput("condition1", "Condition 1:", choices = c("Hypoxia", "Normoxia")),
+      selectInput("model2", "Model 2:", choices = c("Bioprint", "Neurosphere", "Geltrex", "Microtumor")),
+      selectInput("condition2", "Condition 2:", choices = c("Hypoxia", "Normoxia")),
+      actionButton("generate", "Generate")
+    ),
+    mainPanel(
+      width = 10,
+      tabsetPanel(
+        tabPanel("Dot Plot", plotlyOutput("dotPlot")),
+        tabPanel("Volcano Plot", 
+                 sliderInput("fdr_threshold", "FDR Threshold:", 
+                             min = 0, max = 0.1, value = 0.05, step = 0.01),
+                 plotlyOutput("volcanoPlot")),
+        tabPanel("Diff Expression Table", DTOutput("diffTable")),
+        tabPanel("Equivalence Test Table", DTOutput("equivTable"))
+      )
+    )
+  )
+)
+
+# =================== SERVER ===================
+server <- function(input, output, session) {
+  
+  # Mapping for full model names to abbreviations
+  model_abbr <- c("Bioprint" = "B", "Neurosphere" = "N", "Geltrex" = "G", "Microtumor" = "M")
+  # Mapping for full condition names to abbreviations
+  condition_abbr <- c("Hypoxia" = "H", "Normoxia" = "N")
+  
+  selected_data <- eventReactive(input$generate, {
+    req(input$generate > 0)
+    withProgress(message = "Calculating results (this might take up to 1 minute)...", value = 0, {
+      
+      incProgress(0.1, detail = "Setting up groups")
+      # Group format: Xenoline.Abbrev.Condition (e.g., "XD456.B.H")
+      xeno <- input$xeno
+      group1 <- paste0(xeno, ".", model_abbr[input$model1], ".", condition_abbr[input$condition1])
+      group2 <- paste0(xeno, ".", model_abbr[input$model2], ".", condition_abbr[input$condition2])
+      
+      incProgress(0.2, detail = "Running differential expression analysis")
+      ## Differential Expression Analysis ##
+      # Use raw normalized counts (GBM_norm) for voom.
+      pattern1 <- paste0("^", group1, "\\.")
+      pattern2 <- paste0("^", group2, "\\.")
+      cols1 <- grep(pattern1, colnames(GBM_norm), value = TRUE)
+      cols2 <- grep(pattern2, colnames(GBM_norm), value = TRUE)
+      
+      if(length(cols1) == 0 || length(cols2) == 0) {
+        showNotification("Missing samples for one of the groups.", type = "error")
+        return(NULL)
+      }
+      
+      expr_mat <- as.matrix(GBM_norm[, c(cols1, cols2)])
+      group_labels <- factor(c(rep(group1, length(cols1)), rep(group2, length(cols2))))
+      design <- model.matrix(~ group_labels)
+      
+      diff_results <- tryCatch({
+        v <- voom(expr_mat, design, plot = FALSE)
+        fit <- lmFit(v, design)
+        fit <- eBayes(fit)
+        res <- topTable(fit, coef = 2, adjust.method = "BH", number = Inf)
+        res <- cbind(Gene = rownames(res), res)
+        rownames(res) <- NULL
+        res
+      }, error = function(e) {
+        showNotification(paste("Error in differential expression analysis:", e$message), type = "error")
+        return(NULL)
+      })
+      
+      if (is.null(diff_results)) return(NULL)
+      
+      # Filter for significance: |logFC| > 1.5 and adjusted p-value below threshold
+      diff_sig <- diff_results %>% 
+        filter(abs(logFC) > 1.5, `adj.P.Val` < input$fdr_threshold)
+      
+      incProgress(0.3, detail = "Running equivalence testing")
+      ## Equivalence Testing ##
+      equiv_results <- tryCatch({
+        if(!(group1 %in% colnames(mean_values_df)) || !(group2 %in% colnames(mean_values_df))) {
+          showNotification("Mean expression data missing for one of the groups.", type = "error")
+          data.frame()
+        } else {
+          residual_var <- apply(mean_values_df, 1, function(x) var(as.numeric(x), na.rm = TRUE))
+          equiv_input <- cbind(mean_values_df[[group1]], mean_values_df[[group2]], residual_var)
+          c_value <- 1
+          df_value <- ncol(mean_values_df) - 1
+          sigma00_value <- 1
+          Delta_value <- 1.5
+          tmp <- equivtest2comp(equiv_input, c_value, df_value, sigma00_value, Delta_value)
+          tmp_df <- as.data.frame(tmp)
+          colnames(tmp_df) <- c("UMPI_pval", "TOST_pval", "Final_pval")
+          tmp_df <- cbind(Gene = rownames(mean_values_df), tmp_df)
+          rownames(tmp_df) <- NULL
+          tmp_df %>% filter(Final_pval < input$fdr_threshold)
+        }
+      }, error = function(e) {
+        showNotification(paste("Error in equivalence testing:", e$message), type = "error")
+        data.frame()
+      })
+      
+      incProgress(0.1, detail = "Finalizing results")
+      list(diff = diff_results, diff_sig = diff_sig, equiv = equiv_results,
+           group1 = group1, group2 = group2)
+    })
+  })
+  
+  # ---------------- Dot Plot ----------------
+  # Dot plot: x-axis is mean expression for group 1, y-axis is mean expression for group 2.
+  # Background: all genes in black; overlays: red for significantly differentially expressed, blue for significantly equivalently expressed.
+  output$dotPlot <- renderPlotly({
+    req(selected_data())
+    data <- selected_data()
+    expression_df <- data.frame(
+      Gene = rownames(mean_values_df),
+      Mean1 = mean_values_df[[data$group1]],
+      Mean2 = mean_values_df[[data$group2]]
+    )
+    
+    # Add dummy point data frame to force "All Genes" in legend. Use a point within the plot limits, but set size=0 so it's not visible.
+    dummy_df <- data.frame(x = -5, y = -5, Status = "All Genes")
+    
+    p <- ggplot() +
+      # Dummy layer for "All Genes"
+      geom_point(data = dummy_df,
+                 aes(x = x, y = y, color = Status),
+                 size = 0, alpha = 0) +
+      # Background: all genes in black
+      geom_point(data = expression_df, 
+                 aes(x = Mean1, y = Mean2, text = paste("Gene:", Gene)), 
+                 color = "black", size = 0.5, alpha = 0.5) +
+      # Overlay: significantly differentially expressed genes in red
+      geom_point(data = expression_df[expression_df$Gene %in% data$diff_sig$Gene, ], 
+                 aes(x = Mean1, y = Mean2, text = paste("Gene:", Gene), 
+                     color = "Significantly Differentially Expressed Genes"), 
+                 size = 0.5, alpha = 0.8) +
+      # Overlay: significantly equivalently expressed genes in blue
+      geom_point(data = expression_df[expression_df$Gene %in% data$equiv$Gene, ], 
+                 aes(x = Mean1, y = Mean2, text = paste("Gene:", Gene), 
+                     color = "Significantly Equivalently Expressed Genes"), 
+                 size = 0.5, alpha = 0.8) +
+      labs(title = paste("Expression Comparison:", data$group1, "vs", data$group2),
+           x = paste("Mean Expression:", data$group1),
+           y = paste("Mean Expression:", data$group2)) +
+      theme_minimal() +
+      theme(legend.position = "bottom", legend.direction = "horizontal") +
+      scale_color_manual(name = "Significant Status",
+                         values = c("All Genes" = "black",
+                                    "Significantly Differentially Expressed Genes" = "red",
+                                    "Significantly Equivalently Expressed Genes" = "blue")) +
+      scale_x_continuous(limits = c(-5, 20)) +
+      scale_y_continuous(limits = c(-5, 20))
+    
+    ggplotly(p, tooltip = c("text", "x", "y", "color"))
+  })
+  
+  # ---------------- Volcano Plot ----------------
+  # Volcano plot: x-axis limits -10 to 10.
+  # Tooltip shows "Gene:" followed by gene name.
+  output$volcanoPlot <- renderPlotly({
+    req(selected_data())
+    data <- selected_data()
+    volcano_data <- data$diff
+    volcano_data$Sig <- ifelse(abs(volcano_data$logFC) > 1.5 & volcano_data$`adj.P.Val` < input$fdr_threshold,
+                               "Significantly Differentially Expressed Genes", "Not Significant")
+    
+    p <- ggplot(volcano_data, aes(x = logFC, y = -log10(`adj.P.Val`), 
+                                  text = paste("Gene:", Gene), color = Sig)) +
+      geom_point(size = 0.5, alpha = 0.5) +
+      scale_color_manual(name = "Significant Status", 
+                         values = c("Significantly Differentially Expressed Genes" = "red", 
+                                    "Not Significant" = "black"),
+                         labels = c("Significantly Differentially Expressed Genes" = "Significantly Differentially Expressed Genes",
+                                    "Not Significant" = "Not Significant")) +
+      geom_vline(xintercept = c(-1.5, 1.5), linetype = "dashed", color = "red") +
+      geom_hline(yintercept = -log10(input$fdr_threshold), linetype = "dashed", color = "red") +
+      labs(title = paste("Volcano Plot:", data$group1, "vs", data$group2),
+           x = "logFC", y = "-log10(adj.P.Val)") +
+      theme_minimal() +
+      scale_x_continuous(limits = c(-10, 10))
+    
+    ggplotly(p, tooltip = c("text", "x", "y", "color"))
+  })
+  
+  # ---------------- Data Tables ----------------
+  output$diffTable <- renderDT({
+    req(selected_data())
+    datatable(selected_data()$diff_sig)
+  })
+  
+  output$equivTable <- renderDT({
+    req(selected_data())
+    datatable(selected_data()$equiv)
+  })
+  
+}
+
+shinyApp(ui, server)
+
+```
+
