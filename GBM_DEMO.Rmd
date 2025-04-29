@@ -1,13 +1,11 @@
 ---
 title: "GBM Shiny Dashboard"
-output: 
+output:
   flexdashboard::flex_dashboard:
     orientation: columns
     vertical_layout: fill
 runtime: shiny
 ---
-Welcome to the GBM Shiny Dashboard!  
-This interactive dashboard allows users to explore gene expression differences in glioblastoma multiforme under hypoxia vs. normoxia. Use the plots below to filter and analyze key genes across experimental conditions.
 
 ```{r internal, echo=FALSE, results='hide'}
 # Loading Libraries
@@ -23,6 +21,39 @@ library(openxlsx)
 library(readxl)
 library(rsconnect)
 ```
+
+Column {sidebar}
+-----------------------------------------------------------------------
+
+### Dashboard Description
+
+Welcome to the GBM Shiny Dashboard!  
+This interactive dashboard allows users to explore gene expression differences in glioblastoma multiforme (GBM) under hypoxia vs. normoxia. Use the controls to select specific xenolines, models, and conditions. Visualizations provide clear statistical evidence of differentially and equivalently expressed genes, with tooltips and interactivity to aid exploration. Please select the model and condition you want to compare and scroll down to hit the generate button to visualize the results!
+
+### Key Takeaways
+
+**Dot Plot**: Genes in red are significantly differentially expressed (log2FC > 1.5, adjusted p < 0.05), while genes in blue are statistically equivalent based on UMPI and TOST methods. Most genes lie near the diagonal, suggesting similarity between the two groups, with Microtumor showing the most divergence in several comparisons.
+
+**Volcano Plot**: Red dots represent genes that are significantly different in expression with large fold changes and high confidence, while black dots are non-significant. Upregulated genes appear at the top right; downregulated genes appear at the top left of the plot.
+
+**Tables**: Outout from differential expression analysis and equivalence testing is included. Feel free to rank by clicking on the small arrows on the headers.
+
+### Dataset Info
+
+The GBM dataset was derived from normalized RNA expression values for three xenolines (XD456, X1441, and JX39P) under two oxygen conditions across four tumor models. Data were collected via a controlled in vitro experiment and preprocessed with pseudo-counts, log2 transformation, and replicate averaging.
+
+### Project Relevance
+
+This dashboard highlights model-driven gene expression shifts in GBM, supporting targeted investigation of cell models in hypoxic environments. The interactive design makes it useful for experimental planning and manuscript figures.
+
+### Links
+
+[GitHub Repo with Source Code and README](https://github.com/Oc315/GBM_Shiny_Dashboard)  
+[Live Shiny App](https://oceanus.shinyapps.io/gbm_shiny/)
+
+
+Column
+-----------------------------------------------------------------------
 
 ```{r}
 # =================== DATA LOAD & PREP ===================
@@ -274,6 +305,6 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
-
+# rsconnect::deployApp("/Users/oceanuszhang/Desktop/GBM/GBM_Shiny")
 ```
 

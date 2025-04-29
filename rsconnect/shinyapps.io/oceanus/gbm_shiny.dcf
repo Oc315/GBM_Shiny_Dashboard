@@ -5,6 +5,6 @@ account: oceanus
 server: shinyapps.io
 hostUrl: https://api.shinyapps.io/v1
 appId: 14611868
-bundleId: 10175144
+bundleId: 10202417
 url: https://oceanus.shinyapps.io/gbm_shiny/
 version: 1
